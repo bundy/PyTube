@@ -304,14 +304,18 @@ class CommentStream(Stream, LinksMixin):
         self._parse_links(data[u'feed'][u'link'])
         return [Comment(d) for d in data['feed']['entry']]
 
+
 class PlaylistEntry(object):
     def __init__(self, client, playlist_id, entry_data):
-        #self.id = entry_data['id'] - YT API Fail. Should be fixed soon: http://goo.gl/xrBSc
-        self.position = entry_data['position']
+        self.id = entry_data[u'id'][u'$t'].split(':')[-1]
+        self.api_id = entry_data[u'id']
+        self.position = entry_data[u'yt$position'][u'$t']
         self.playlist_id = playlist_id
 
-        #vid = Video(client, entry_data)
-        #self.video = vid
+        vid = Video(client, entry_data)
+        # replace api_id since it'll be the playlist entry api_id and not the video one
+        vid.api_id = vid.api_id[:vid.api_id.find('playlist')] + 'video:' + vid.id
+        self.video = vid
 
     def __str__(self):
         return '%s: %s (%s)' % (self.position, self.id, self.video.id)
@@ -319,15 +323,16 @@ class PlaylistEntry(object):
     def __unicode__(self):
         return self.__str__()
 
+
 class Playlist(object):
     ADD_VIDEO_URL = "http://gdata.youtube.com/feeds/api/playlists/%(playlist_id)s"
     EDIT_VIDEO_URL = "http://gdata.youtube.com/feeds/api/playlists/%(playlist_id)s/%(playlist_entry_id)s"
 
-    def _handle_videos(self, entries):
+    def _handle_videos(self, data):
         """
         Loads each video into a PlaylistEntry and returns them listed in order
         """
-        self.entries = [PlaylistEntry(self.client, self.id, entry) for entry in entries]
+        self.entries = [PlaylistEntry(self.client, self.id, entry) for entry in data[u'entry']]
         self.entries = sorted(self.entries, key=lambda entry: entry.position)
 
     def remove_entry(self, entry_id, timeout=None):
@@ -343,14 +348,18 @@ class Playlist(object):
         json_response = self.client._gdata_jsonc(add_video_url, 'POST', request_body=json.dumps(params))
 
     def __init__(self, client, data):
-        self.client = client
-        self.id = data['id']
-        self.author = data['author']
-        self.title = data['title']
-        self.description = data['description']
-        self.tags = data['tags']
+        assert data[u'version'] == u'1.0', "Youtube API version mismatch"
+        data = data['feed']
 
-        self._handle_videos(data['items'])
+        self.client = client
+        self.id = data[u'yt$playlistId'][u'$t']
+        self.author = data[u'author'][0][u'name'][u'$t']
+        self.title = data[u'media$group'][u'media$description'][u'$t']
+        self.description = data[u'media$group'][u'media$title'][u'$t']
+        self.updated = yt_ts_to_datetime(data[u'updated'][u'$t'])
+
+        self._handle_videos(data)
+
 
 class Client(object):
     """ The YouTube API Client
@@ -634,8 +643,9 @@ class Client(object):
         response = self._gdata_request(self.YOUTUBE_RESPONSE_URL % {'original_video_id': original_video_id }, None, response_data, response_headers)
 
     def playlist(self, playlist_id):
-        json_data = self._gdata_jsonc(self.YOUTUBE_PLAYLIST_URL % {'playlist_id': playlist_id})
+        try:
+            data = self._gdata_json(self.YOUTUBE_PLAYLIST_URL % {'playlist_id': playlist_id}, {'v': 2})
+        except urllib2.HTTPError, e:
+            raise
+        return Playlist(self, data)
 
-        if json_data['status'] != 200:
-            raise pytube.exceptions.PlaylistException(json_data['response'])
-        return Playlist(self, json_data['data'])
