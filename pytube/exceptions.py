@@ -47,3 +47,7 @@ class VideoUpdateException(VideoException):
 
     def __str__(self):
         return self.message
+
+
+class PlaylistException(Exception):
+    """ Base exception class for playlists """

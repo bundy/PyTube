@@ -1,5 +1,6 @@
 try: import simplejson as json
 except ImportError: import json
+import operator
 import urllib, urllib2
 import datetime
 import warnings
@@ -127,8 +128,11 @@ class Video(YtData, LinksMixin):
             assert len(data[u'id'][u'$t']) == 53
             self.id = data[u'id'][u'$t'][-11:]
 
-        self.published = yt_ts_to_datetime(data[u'published'][u'$t'])
         self.updated = yt_ts_to_datetime(data[u'updated'][u'$t'])
+        if u'published' in data: # Not given to us by playlists
+            self.published = yt_ts_to_datetime(data[u'published'][u'$t'])
+        else:
+            self.published = self.updated # just default to updated date for now
 
         if u'yt$rating' in data:
             self.like_count = int(data[u'yt$rating'][u'numLikes'])
@@ -300,6 +304,53 @@ class CommentStream(Stream, LinksMixin):
         self._parse_links(data[u'feed'][u'link'])
         return [Comment(d) for d in data['feed']['entry']]
 
+class PlaylistEntry(object):
+    def __init__(self, client, playlist_id, entry_data):
+        #self.id = entry_data['id'] - YT API Fail. Should be fixed soon: http://goo.gl/xrBSc
+        self.position = entry_data['position']
+        self.playlist_id = playlist_id
+
+        #vid = Video(client, entry_data)
+        #self.video = vid
+
+    def __str__(self):
+        return '%s: %s (%s)' % (self.position, self.id, self.video.id)
+
+    def __unicode__(self):
+        return self.__str__()
+
+class Playlist(object):
+    ADD_VIDEO_URL = "http://gdata.youtube.com/feeds/api/playlists/%(playlist_id)s"
+    EDIT_VIDEO_URL = "http://gdata.youtube.com/feeds/api/playlists/%(playlist_id)s/%(playlist_entry_id)s"
+
+    def _handle_videos(self, entries):
+        """
+        Loads each video into a PlaylistEntry and returns them listed in order
+        """
+        self.entries = [PlaylistEntry(self.client, self.id, entry) for entry in entries]
+        self.entries = sorted(self.entries, key=lambda entry: entry.position)
+
+    def remove_entry(self, entry_id, timeout=None):
+        timeout = timeout or self.client.default_timeout
+        edit_video_url = self.EDIT_VIDEO_URL % {'playlist_id': self.id, 'playlist_entry_id': entry_id}
+        json_response = self.client._gdata_jsonc(edit_video_url, 'DELETE')
+
+    def add_video(self, video_id, timeout=None):
+        timeout = timeout or self.client.default_timeout
+        add_video_url = self.ADD_VIDEO_URL % {'playlist_id': self.id}
+
+        params = {'data': {'video': {'id': video_id}}}
+        json_response = self.client._gdata_jsonc(add_video_url, 'POST', request_body=json.dumps(params))
+
+    def __init__(self, client, data):
+        self.client = client
+        self.id = data['id']
+        self.author = data['author']
+        self.title = data['title']
+        self.description = data['description']
+        self.tags = data['tags']
+
+        self._handle_videos(data['items'])
 
 class Client(object):
     """ The YouTube API Client
@@ -312,6 +363,7 @@ class Client(object):
     GOOGLE_AUTH_URL = 'https://www.google.com/accounts/ClientLogin'
     YOUTUBE_SEARCH_URL = 'http://gdata.youtube.com/feeds/api/videos'
     YOUTUBE_VIDEO_URL = 'http://gdata.youtube.com/feeds/api/videos/%(video_id)s'
+    YOUTUBE_PLAYLIST_URL = 'https://gdata.youtube.com/feeds/api/playlists/%(playlist_id)s'
     YOUTUBE_PROFILE_URL = 'http://gdata.youtube.com/feeds/api/users/%(username)s'
     YOUTUBE_UPLOADS_URL = 'http://gdata.youtube.com/feeds/api/users/%(username)s/uploads'
     YOUTUBE_COMMENTS_URL = 'http://gdata.youtube.com/feeds/api/videos/%(video_id)s/comments'
@@ -348,6 +400,46 @@ class Client(object):
                 'Authorization': "AuthSub token=" + self._auth_data['authsub_token'],
             }
         return {}
+
+
+    def _http_request(self, url, method='GET', request_body='', params={}, headers={}, timeout=None):
+        parsed_url = urlparse.urlparse(url)
+        params = urllib.urlencode(params)
+        request_url = parsed_url.path
+
+        if method == 'POST':
+            request_body += params
+        elif method == 'GET':
+            request_url = '%s?%s' % (request_url, params)
+
+        with contextlib.closing( # Just ensures we close the connection no matter what
+            httplib.HTTPConnection(parsed_url.netloc, timeout=timeout)
+        ) as connection:
+            connection.request(method, request_url, request_body, headers)
+            response = connection.getresponse()
+            return (response.status, response.read())
+
+        return None
+
+    def _gdata_jsonc(self, url, method='GET', request_body='', params={}, headers={}, timeout=None):
+        params.update({'alt': 'jsonc'})
+        headers.update({
+            'Content-Type': 'application/json',
+            'GData-Version': 2 # jsonc requires v2
+        })
+        headers.update(self._default_headers())
+
+        status, response = self._http_request(url, method, request_body, params, headers, timeout)
+        json_response = {'status': status, 'response': response, 'data': {}}
+
+        if (status == 200 and method == 'GET') or status == 201:
+            json_response['data'] = json.loads(response)['data']
+        elif status in (401, 403): # Handle these errors here, but pass on rest
+            if 'TokenExpired' in response:
+                raise pytube.exceptions.TokenExpired(response)
+            raise pytube.exceptions.AuthenticationError(response)
+
+        return json_response
 
     def _gdata_request(self, url, query=None, data=None, headers=None, timeout=None):
         timeout = timeout or self.default_timeout
@@ -541,3 +633,9 @@ class Client(object):
         response_headers = { 'Content-Type': 'application/atom+xml'}
         response = self._gdata_request(self.YOUTUBE_RESPONSE_URL % {'original_video_id': original_video_id }, None, response_data, response_headers)
 
+    def playlist(self, playlist_id):
+        json_data = self._gdata_jsonc(self.YOUTUBE_PLAYLIST_URL % {'playlist_id': playlist_id})
+
+        if json_data['status'] != 200:
+            raise pytube.exceptions.PlaylistException(json_data['response'])
+        return Playlist(self, json_data['data'])
