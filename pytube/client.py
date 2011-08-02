@@ -1,5 +1,6 @@
 try: import simplejson as json
 except ImportError: import json
+import re
 import operator
 import urllib, urllib2
 import datetime
@@ -113,14 +114,34 @@ class Video(YtData, LinksMixin):
         self.keywords = [kw['term'] for kw in keywords]
         return
 
-    def __init__(self, client, data):
-        self.client = client
+    def _init_jsonc(self, data):
+        # missing insight_url and private fields when compared to json resposne
+        self.id = data['id']
+        self.title = data['title']
+        self.author = data['uploader']
+        self.category = data['category']
+        self.description = data['description']
+        self.comment_count = int(data['commentCount'])
+        self.comments = self.client.video_comments(self.id)
+        self.duration = int(data['duration'])
+        self.favorite_count = int(data['favoriteCount'])
+        self.like_count = int(data['likeCount'])
+        self.updated = yt_ts_to_datetime(data['updated'])
+        self.uploaded = yt_ts_to_datetime(data['uploaded'])
+        self.published = self.uploaded
+        self.view_count = int(data['viewCount'])
+        self.aspect_ratio = data['aspectRatio']
+        self.keywords = data['tags']
+        self.dislike_count = int(data['ratingCount']) - self.like_count
+        self.private = False # Not returned by jsonc for now
+
+    def _init_json(self, data):
         self._parse_links(data[u'link'])
         self._parse_categories(data[u'category'])
-
         self.title = data[u'title'][u'$t']
         self.author = data[u'author'][0][u'name'][u'$t']
         self.api_id = data[u'id']['$t']
+
         try:
             self.id = data[u'media$group'][u'yt$videoid'][u'$t']
         except KeyError:
@@ -138,9 +159,8 @@ class Video(YtData, LinksMixin):
             self.like_count = int(data[u'yt$rating'][u'numLikes'])
             self.dislike_count = int(data[u'yt$rating'][u'numDislikes'])
 
-        self.comments = self.client.video_comments(self.id)
-
         self.access_control = dict((d[u'action'], d[u'permission']) for d in data[u'yt$accessControl'])
+        self.comments = self.client.video_comments(self.id)
 
         # All the following attributes don't exist for certain restricted videos
         if u'media$description' in data[u'media$group']:
@@ -163,6 +183,13 @@ class Video(YtData, LinksMixin):
         else:
             self.private = False
 
+    def __init__(self, client, data, data_format='json'):
+        self.client = client
+
+        if data_format == 'jsonc':
+            self._init_jsonc(data)
+        else:
+            self._init_json(data)
 
     def __repr__(self):
         return "<YouTube Video: %s>" % (str(self.id),)
@@ -308,44 +335,29 @@ class CommentStream(Stream, LinksMixin):
 class PlaylistEntry(object):
     def __init__(self, client, playlist_id, entry_data):
         self.id = entry_data[u'id'][u'$t'].split(':')[-1]
-        self.api_id = entry_data[u'id']
-        self.position = entry_data[u'yt$position'][u'$t']
+        self.api_id = entry_data[u'id'][u'$t']
+        self.position = int(entry_data[u'yt$position'][u'$t'])
         self.playlist_id = playlist_id
 
         vid = Video(client, entry_data)
-        # replace api_id since it'll be the playlist entry api_id and not the video one
-        vid.api_id = vid.api_id[:vid.api_id.find('playlist')] + 'video:' + vid.id
         self.video = vid
 
+        # replace api_id since it'll be the playlist entry api_id and not the video one
+        vid.api_id = vid.api_id[:vid.api_id.find('playlist')] + 'video:' + vid.id
+
     def __str__(self):
-        return '%s: %s (%s)' % (self.position, self.id, self.video.id)
+        return '<PlaylistEntry %s: %s (%s)' % (self.position, self.id, self.video.id)
+
+    def __repr__(self):
+        return self.__str__()
 
     def __unicode__(self):
         return self.__str__()
 
 
 class Playlist(object):
-    ADD_VIDEO_URL = "http://gdata.youtube.com/feeds/api/playlists/%(playlist_id)s"
+    ADD_VIDEO_URL = "http://gdata.youtube.com/feeds/api/playlists/%(playlist_id)s?v=2&alt=json"
     EDIT_VIDEO_URL = "http://gdata.youtube.com/feeds/api/playlists/%(playlist_id)s/%(playlist_entry_id)s"
-
-    def _handle_videos(self, data):
-        """
-        Loads each video into a PlaylistEntry and returns them listed in order
-        """
-        self.entries = [PlaylistEntry(self.client, self.id, entry) for entry in data[u'entry']]
-        self.entries = sorted(self.entries, key=lambda entry: entry.position)
-
-    def remove_entry(self, entry_id, timeout=None):
-        timeout = timeout or self.client.default_timeout
-        edit_video_url = self.EDIT_VIDEO_URL % {'playlist_id': self.id, 'playlist_entry_id': entry_id}
-        json_response = self.client._gdata_jsonc(edit_video_url, 'DELETE')
-
-    def add_video(self, video_id, timeout=None):
-        timeout = timeout or self.client.default_timeout
-        add_video_url = self.ADD_VIDEO_URL % {'playlist_id': self.id}
-
-        params = {'data': {'video': {'id': video_id}}}
-        json_response = self.client._gdata_jsonc(add_video_url, 'POST', request_body=json.dumps(params))
 
     def __init__(self, client, data):
         assert data[u'version'] == u'1.0', "Youtube API version mismatch"
@@ -359,6 +371,72 @@ class Playlist(object):
         self.updated = yt_ts_to_datetime(data[u'updated'][u'$t'])
 
         self._handle_videos(data)
+
+    def _handle_videos(self, data):
+        """
+        Loads each video into a PlaylistEntry and returns them listed in order
+        """
+        self.entries = [PlaylistEntry(self.client, self.id, entry) for entry in data[u'entry']]
+        self.entries = sorted(self.entries, key=lambda entry: entry.position)
+
+    def remove_entry(self, entry_id, timeout=None):
+        timeout = timeout or self.client.default_timeout
+        edit_video_url = self.EDIT_VIDEO_URL % {'playlist_id': self.id, 'playlist_entry_id': entry_id}
+        json_response = self.client._gdata_jsonc(edit_video_url, 'DELETE')
+
+        # Remove deleted entry and update entry positions
+        if json_response['status'] == 200:
+            pos_count = 1
+            del_pos = 0
+
+            for i in range(len(self.entries)):
+                if self.entries[i].id == entry_id:
+                    del_pos = i
+                else:
+                    self.entries[i].position = pos_count
+                    pos_count += 1
+            del self.entries[del_pos]
+
+    def remove_video(self, video_id, timeout=None):
+        for entry in self.entries:
+            if entry.video.id == video_id:
+                self.remove_entry(entry.id, timeout)
+                break;
+
+    def add_video(self, video_id, timeout=None):
+        timeout = timeout or self.client.default_timeout
+        add_video_url = self.ADD_VIDEO_URL % {'playlist_id': self.id}
+        request_body = """<?xml version="1.0" encoding="UTF-8"?>
+<entry xmlns="http://www.w3.org/2005/Atom"
+    xmlns:yt="http://gdata.youtube.com/schemas/2007">
+  <id>%s</id>
+</entry>""" % video_id
+        url = urlparse.urlparse(add_video_url)
+        headers = self.client._default_headers()
+        headers['GData-Version'] = 2
+        headers['Content-Type'] = 'application/atom+xml'
+
+        with contextlib.closing(
+            httplib.HTTPConnection(url.netloc, timeout=timeout)
+            ) as connection:
+            connection.request("POST", '%s?%s' % (url.path, url.query), request_body, headers)
+            response = connection.getresponse()
+            response_body = response.read()
+
+        if response.status != 201:
+            data = {
+                'url': add_video_url,
+                'request_body': request_body,
+                'headers': headers,
+                'response': response,
+                'response_body': response_body
+            }
+            msg = 'Response Status: %s\n%s' % (response.status, response_body)
+            e = pytube.exceptions.PlaylistException(msg, data)
+            raise e
+
+        entry_data = json.loads(response_body)
+        self.entries.append(PlaylistEntry(self.client, self.id, entry_data['entry']))
 
 
 class Client(object):
@@ -418,8 +496,11 @@ class Client(object):
 
         if method == 'POST':
             request_body += params
+            if parsed_url.query != '':
+                request_url =  '%s?%s' % (request_url, parsed_url.query)
         elif method == 'GET':
             request_url = '%s?%s' % (request_url, params)
+            request_url += parsed_url.query
 
         with contextlib.closing( # Just ensures we close the connection no matter what
             httplib.HTTPConnection(parsed_url.netloc, timeout=timeout)
@@ -431,7 +512,6 @@ class Client(object):
         return None
 
     def _gdata_jsonc(self, url, method='GET', request_body='', params={}, headers={}, timeout=None):
-        params.update({'alt': 'jsonc'})
         headers.update({
             'Content-Type': 'application/json',
             'GData-Version': 2 # jsonc requires v2
